@@ -26,6 +26,18 @@ Chat will use LLM API Keys configured in Settings -> LLM API Keys. When a chat r
 
 See [Supported LLM Providers](/docs/platform-supported-llm-providers) for the full list.
 
+## MCP Apps
+
+MCP servers can expose interactive UI panels alongside tool results. When a tool's definition includes a UI resource URI, Chat renders the app inline below the tool call instead of showing raw JSON output.
+
+MCP Apps run inside a double-sandboxed iframe: an outer proxy iframe on a separate origin enforces CSP, and an inner iframe renders the untrusted HTML. The two iframes communicate with the host page via the AppBridge protocol.
+
+**Display modes** — Apps start inline and can request fullscreen via the AppBridge protocol. Press Escape or the close button to return to inline.
+
+**Tool calls from apps** — An MCP App can invoke tools on its own MCP server directly from the UI. These calls are proxied through `/api/mcp/{agentId}` and appear in the chat history like any other tool call.
+
+**Permissions** — Camera, microphone, geolocation, and clipboard-write access are opt-in. The MCP server must declare them in the resource `_meta.ui.permissions` field; the user's browser will prompt for consent as normal.
+
 ## Security Notes
 
 - API keys are stored encrypted using the configured [secrets manager](/docs/platform-secrets-management)

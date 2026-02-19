@@ -1,8 +1,9 @@
-import type { UIMessage } from "@ai-sdk/react";
-import type { ChatStatus, DynamicToolUIPart, ToolUIPart } from "ai";
+import type {UIMessage} from "@ai-sdk/react";
+import type {ChatStatus, DynamicToolUIPart, ToolUIPart} from "ai";
 import Image from "next/image";
 import {
   Fragment,
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -30,6 +31,7 @@ import {
   ToolOutput,
 } from "@/components/ai-elements/tool";
 import { Button } from "@/components/ui/button";
+import {useGlobalChat} from "@/contexts/global-chat-context";
 import { useHasPermissions } from "@/lib/auth.query";
 import { useUpdateChatMessage } from "@/lib/chat-message.query";
 import {
@@ -43,6 +45,7 @@ import { extractFileAttachments, hasTextPart } from "./chat-messages.utils";
 import { EditableAssistantMessage } from "./editable-assistant-message";
 import { EditableUserMessage } from "./editable-user-message";
 import { InlineChatError } from "./inline-chat-error";
+import {McpAppSection, type McpToolOutput} from "./mcp-app-container";
 import { PolicyDeniedTool } from "./policy-denied-tool";
 import { TodoWriteTool } from "./todo-write-tool";
 import { ToolErrorLogsButton } from "./tool-error-logs-button";
@@ -90,7 +93,9 @@ function isToolPart(part: any): part is {
     typeof part === "object" &&
     part !== null &&
     "type" in part &&
-    (part.type?.startsWith("tool-") || part.type === "dynamic-tool")
+    (part.type?.startsWith("tool-") ||
+      part.type?.startsWith("data-tool-ui-start") ||
+      part.type === "dynamic-tool")
   );
 }
 
@@ -119,6 +124,11 @@ export function ChatMessages({
 
   // Initialize mutation hook with conversationId (use empty string as fallback for hook rules)
   const updateChatMessageMutation = useUpdateChatMessage(conversationId || "");
+
+  // Get early UI data from the chat session
+  const { getSession } = useGlobalChat();
+  const session = conversationId ? getSession(conversationId) : null;
+  const earlyToolUiStarts = session?.earlyToolUiStarts || {};
 
   // Debounce resize mode change when exiting edit mode to let DOM settle
   const isEditing = editingPartKey !== null;
@@ -464,6 +474,7 @@ export function ChatMessages({
           {messages.map((message, idx) => {
             const isDimmed =
               editingMessageIndex !== -1 && idx > editingMessageIndex;
+
             return (
               <div
                 key={message.id || idx}
@@ -785,18 +796,99 @@ export function ChatMessages({
                       return (
                         <MessageTool
                           part={part}
-                          key={`${message.id}-${i}`}
+                          key={`${message.id}-${part.toolCallId ?? i}`}
                           toolResultPart={toolResultPart}
                           toolName={toolName}
                           agentId={agentId}
                           onToolApprovalResponse={onToolApprovalResponse}
+                          onSendMessage={(text) =>
+                            session?.sendMessage({
+                              role: "user",
+                              parts: [{ type: "text", text }],
+                            })
+                          }
                         />
                       );
                     }
 
                     default: {
-                      // Handle tool invocations (type is "tool-{toolName}")
+                      // data-tool-ui-start: early MCP App initialisation.
+                      // This is the canonical render for the tool UI. It looks ahead
+                      // in the parts array to find the matching input/output parts so
+                      // a single <MessageTool> covers the full lifecycle.
+                      if (part.type?.startsWith("data-tool-ui-start")) {
+                        // biome-ignore lint/suspicious/noExplicitAny: data-tool-ui-start shape is dynamic
+                        const earlyPart = part as any;
+                        const tcId = earlyPart.data?.toolCallId as
+                          | string
+                          | undefined;
+                        const toolName = earlyPart.data?.toolName as
+                          | string
+                          | undefined;
+                        if (!tcId || !toolName) return null;
+
+                        // Find the matching tool-* parts (may or may not exist yet)
+                        // biome-ignore lint/suspicious/noExplicitAny: part shape varies
+                        const allParts = (message.parts ?? []) as any[];
+                        const inputPart = allParts.find(
+                          (p) =>
+                            isToolPart(p) &&
+                            p.toolCallId === tcId &&
+                            p.state !== "output-available",
+                        ) as ToolUIPart | undefined;
+
+                        const outputPart = (allParts.find(
+                          (p) =>
+                            isToolPart(p) &&
+                            p.toolCallId === tcId &&
+                            p.state === "output-available",
+                        ) ?? null) as ToolUIPart | null;
+
+                        // Synthetic part used until the real tool-* part appears.
+                        // If only outputPart exists (tool already done), borrow its input.
+                        const effectivePart = (inputPart ?? {
+                          type: `tool-${toolName}` as `tool-${string}`,
+                          toolCallId: tcId,
+                          state: outputPart
+                            ? ("output-available" as const)
+                            : ("input-streaming" as const),
+                          input: outputPart?.input ?? {},
+                          output: outputPart?.output,
+                        }) as ToolUIPart;
+
+                        return (
+                          <MessageTool
+                            key={`${message.id}-${tcId}`}
+                            part={effectivePart}
+                            toolResultPart={outputPart}
+                            toolName={toolName}
+                            agentId={agentId}
+                            onToolApprovalResponse={onToolApprovalResponse}
+                            onSendMessage={(text) =>
+                              session?.sendMessage({
+                                role: "user",
+                                parts: [{ type: "text", text }],
+                              })
+                            }
+                            earlyToolUiData={earlyToolUiStarts[tcId]}
+                          />
+                        );
+                      }
+
+                      // Regular tool-* parts: skip if a data-tool-ui-start already
+                      // rendered this toolCallId (it owns the full lifecycle above).
                       if (isToolPart(part) && part.type?.startsWith("tool-")) {
+                        const tcId = part.toolCallId;
+                        const hasEarlyStart =
+                          tcId &&
+                          (message.parts ?? []).some(
+                            (p) =>
+                              p.type?.startsWith("data-tool-ui-start") &&
+                              (p as { data?: { toolCallId?: string } }).data
+                                ?.toolCallId === tcId,
+                          );
+                        if (hasEarlyStart) return null;
+
                         const toolName = part.type.replace("tool-", "");
 
                         // Look ahead for tool result (same tool call ID)
@@ -816,11 +908,18 @@ export function ChatMessages({
                         return (
                           <MessageTool
                             part={part}
-                            key={`${message.id}-${i}`}
+                            key={`${message.id}-${part.toolCallId ?? i}`}
                             toolResultPart={toolResultPart}
                             toolName={toolName}
                             agentId={agentId}
                             onToolApprovalResponse={onToolApprovalResponse}
+                            earlyToolUiData={tcId ? earlyToolUiStarts[tcId] : undefined}
+                            onSendMessage={(text) =>
+                              session?.sendMessage({
+                                role: "user",
+                                parts: [{ type: "text", text }],
+                              })
+                            }
                           />
                         );
                       }
@@ -895,43 +994,98 @@ function useStreamingStallDetection(
   return isStreamingStalled;
 }
 
-function MessageTool({
-  part,
-  toolResultPart,
-  toolName,
-  agentId,
-  onToolApprovalResponse,
-}: {
-  part: ToolUIPart | DynamicToolUIPart;
-  toolResultPart: ToolUIPart | DynamicToolUIPart | null;
-  toolName: string;
-  agentId?: string;
-  onToolApprovalResponse?: (params: {
-    id: string;
-    approved: boolean;
-    reason?: string;
-  }) => void;
-}) {
-  const outputError = toolResultPart
-    ? tryToExtractErrorFromOutput(toolResultPart.output)
-    : tryToExtractErrorFromOutput(part.output);
-  const errorText = toolResultPart
-    ? (toolResultPart.errorText ?? outputError)
-    : (part.errorText ?? outputError);
+const MessageTool = memo(
+  function MessageTool({
+    part,
+    toolResultPart,
+    toolName,
+    agentId,
+    onToolApprovalResponse,
+    onSendMessage,
+    earlyToolUiData,
+  }: {
+    part: ToolUIPart | DynamicToolUIPart;
+    toolResultPart: ToolUIPart | DynamicToolUIPart | null;
+    toolName: string;
+    agentId?: string;
+    onToolApprovalResponse?: (params: {
+      id: string;
+      approved: boolean;
+      reason?: string;
+    }) => void;
+    onSendMessage?: (text: string) => void;
+    earlyToolUiData?: {
+      uiResourceUri: string;
+      html?: string;
+      csp?: { connectDomains?: string[]; resourceDomains?: string[] };
+      permissions?: {
+        camera?: boolean;
+        microphone?: boolean;
+        geolocation?: boolean;
+        clipboardWrite?: boolean;
+      };
+    };
+  }) {
+    const rawOutput = toolResultPart ? toolResultPart.output : part.output;
+    const mcpOutput = rawOutput as McpToolOutput | undefined;
+    const uiResourceUri =
+      (mcpOutput?._meta?.ui as { resourceUri?: string } | undefined)?.resourceUri
+      ?? earlyToolUiData?.uiResourceUri;
 
-  // OpenAI sends policy denials as tool errors (see case "text" above for Anthropic path)
-  if (errorText) {
-    const policyDenied = parsePolicyDenied(errorText);
-    if (policyDenied) {
-      return (
-        <PolicyDeniedTool
-          policyDenied={policyDenied}
-          {...(agentId
-            ? { editable: true, profileId: agentId }
-            : { editable: false })}
-        />
-      );
-    }
+    // Use the text content string when available; fall back to the raw output for non-MCP tools.
+    const output = mcpOutput?.content ?? rawOutput;
+
+    const outputError = tryToExtractErrorFromOutput(output);
+    const errorText = toolResultPart
+      ? (toolResultPart.errorText ?? outputError)
+      : (part.errorText ?? outputError);
+
+    const isApprovalRequested = part.state === "approval-requested";
+    const hasInput = part.input && Object.keys(part.input).length > 0;
+    const hasContent = Boolean(
+      hasInput ||
+        errorText ||
+        isApprovalRequested ||
+        (toolResultPart && Boolean(toolResultPart.output)) ||
+        (!toolResultPart && Boolean(part.output)),
+    );
+    const shouldDefaultOpen = !!uiResourceUri || !!earlyToolUiData?.html || !!earlyToolUiData?.uiResourceUri || isApprovalRequested;
+
+    // Hooks must be called before any early returns
+    const [isOpen, setIsOpen] = useState(shouldDefaultOpen);
+    const [userHasInteracted, setUserHasInteracted] = useState(false);
+    const prevShouldDefaultOpenRef = useRef(shouldDefaultOpen);
+
+    useEffect(() => {
+      const prev = prevShouldDefaultOpenRef.current;
+      if (!userHasInteracted) {
+        setIsOpen(shouldDefaultOpen);
+      } else if (shouldDefaultOpen && !prev) {
+        // shouldDefaultOpen changed from false to true -> auto-open
+        setIsOpen(true);
+      }
+      prevShouldDefaultOpenRef.current = shouldDefaultOpen;
+    }, [shouldDefaultOpen, userHasInteracted]);
+    const handleOpenChange = useCallback((open: boolean) => {
+      setIsOpen(open);
+      if (open !== shouldDefaultOpen) {
+        setUserHasInteracted(true);
+      }
+    }, [setIsOpen, shouldDefaultOpen]);
+
+    // OpenAI sends policy denials as tool errors (see case "text" above for Anthropic path)
+    if (errorText) {
+      const policyDenied = parsePolicyDenied(errorText);
+      if (policyDenied) {
+        return (
+          <PolicyDeniedTool
+            policyDenied={policyDenied}
+            {...(agentId
+              ? { editable: true, profileId: agentId }
+              : { editable: false })}
+          />
+        );
+      }
 
     const authRequired = parseAuthRequired(errorText);
     if (authRequired) {
@@ -957,91 +1111,124 @@ function MessageTool({
     );
   }
 
-  const isApprovalRequested = part.state === "approval-requested";
-  const hasInput = part.input && Object.keys(part.input).length > 0;
-  const hasContent = Boolean(
-    hasInput ||
-      errorText ||
-      isApprovalRequested ||
-      (toolResultPart && Boolean(toolResultPart.output)) ||
-      (!toolResultPart && Boolean(part.output)),
-  );
+    // Show logs button for failed tool calls
+    const logsButton = errorText ? (
+      <ToolErrorLogsButton toolName={toolName} />
+    ) : null;
 
-  // Show logs button for failed tool calls
-  const logsButton = errorText ? (
-    <ToolErrorLogsButton toolName={toolName} />
-  ) : null;
+    return (
+      <Tool
+        className={hasContent ? "cursor-pointer" : ""}
+        open={isOpen}
+        onOpenChange={handleOpenChange}
+        defaultOpen={shouldDefaultOpen}
+      >
+        <ToolHeader
+          type={`tool-${toolName}`}
+          state={getHeaderState({
+            state: part.state || "input-available",
+            toolResultPart,
+            errorText,
+          })}
+          isCollapsible={hasContent}
+          actionButton={logsButton}
+        />
+        <ToolContent forceMount={uiResourceUri ? true : undefined}>
+          {hasInput ? <ToolInput input={part.input} /> : null}
+          {isApprovalRequested &&
+            onToolApprovalResponse &&
+            "approval" in part &&
+            part.approval?.id && (
+              <div className="flex items-center gap-2 px-4 pb-4">
+                <Button
+                  size="sm"
+                  variant="default"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onToolApprovalResponse({
+                      id: (part as { approval: { id: string } }).approval.id,
+                      approved: true,
+                    });
+                  }}
+                >
+                  Approve
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onToolApprovalResponse({
+                      id: (part as { approval: { id: string } }).approval.id,
+                      approved: false,
+                      reason: "User denied",
+                    });
+                  }}
+                >
+                  Deny
+                </Button>
+              </div>
+            )}
+          {errorText ? <ToolErrorDetails errorText={errorText} /> : null}
 
-  return (
-    <Tool
-      className={hasContent ? "cursor-pointer" : ""}
-      defaultOpen={isApprovalRequested}
-    >
-      <ToolHeader
-        type={`tool-${toolName}`}
-        state={getHeaderState({
-          state: part.state || "input-available",
-          toolResultPart,
-          errorText,
-        })}
-        isCollapsible={hasContent}
-        actionButton={logsButton}
-      />
-      <ToolContent>
-        {hasInput ? <ToolInput input={part.input} /> : null}
-        {isApprovalRequested &&
-          onToolApprovalResponse &&
-          "approval" in part &&
-          part.approval?.id && (
-            <div className="flex items-center gap-2 px-4 pb-4">
-              <Button
-                size="sm"
-                variant="default"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onToolApprovalResponse({
-                    id: (part as { approval: { id: string } }).approval.id,
-                    approved: true,
-                  });
-                }}
-              >
-                Approve
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onToolApprovalResponse({
-                    id: (part as { approval: { id: string } }).approval.id,
-                    approved: false,
-                    reason: "User denied",
-                  });
-                }}
-              >
-                Deny
-              </Button>
-            </div>
+          {/* Standard MCP Apps flow: tool definition has _meta.ui.resourceUri → AppBridge + AppFrame */}
+          {uiResourceUri && agentId && (
+            <McpAppSection
+              uiResourceUri={uiResourceUri}
+              agentId={agentId}
+              toolName={toolName}
+              toolInput={part.input as Record<string, unknown>}
+              rawOutput={mcpOutput}
+              preloadedResource={
+                earlyToolUiData?.html
+                  ? {
+                      html: earlyToolUiData.html,
+                      csp: earlyToolUiData.csp,
+                      permissions: earlyToolUiData.permissions,
+                    }
+                  : undefined
+              }
+              onSendMessage={onSendMessage}
+            />
           )}
-        {errorText ? <ToolErrorDetails errorText={errorText} /> : null}
-        {toolResultPart && (
-          <ToolOutput
-            label={errorText ? "Error" : "Result"}
-            output={toolResultPart.output}
-            errorText={errorText}
-          />
-        )}
-        {!toolResultPart && Boolean(part.output) && (
-          <ToolOutput
-            label={errorText ? "Error" : "Result"}
-            output={part.output}
-            errorText={errorText}
-          />
-        )}
-      </ToolContent>
-    </Tool>
-  );
-}
+          {/* Show error output even when UI resource is present - errors take priority */}
+          {errorText && uiResourceUri && toolResultPart && (
+            <ToolOutput label="Error" output={output} errorText={errorText} />
+          )}
+          {/* Show text output when NOT rendering a UI resource */}
+          {!uiResourceUri && toolResultPart && (
+            <ToolOutput
+              label={errorText ? "Error" : "Result"}
+              output={output}
+              errorText={errorText}
+            />
+          )}
+          {!uiResourceUri && !toolResultPart && Boolean(part.output) && (
+            <ToolOutput
+              label={errorText ? "Error" : "Result"}
+              output={output}
+              errorText={errorText}
+            />
+          )}
+        </ToolContent>
+      </Tool>
+    );
+  },
+  (prev, next) =>
+    // Skip re-render unless identity, state, or UI-relevant data actually changed.
+    // AI SDK recreates part/toolResultPart objects every streaming tick — compare
+    // by value, not reference. During input-streaming, also re-render on input growth.
+    prev.toolName === next.toolName &&
+    prev.agentId === next.agentId &&
+    prev.part.toolCallId === next.part.toolCallId &&
+    prev.part.state === next.part.state &&
+    (prev.part.state !== "input-streaming" ||
+      prev.part.input === next.part.input) &&
+    prev.toolResultPart?.state === next.toolResultPart?.state &&
+    prev.earlyToolUiData?.uiResourceUri ===
+      next.earlyToolUiData?.uiResourceUri &&
+    !!prev.earlyToolUiData?.html === !!next.earlyToolUiData?.html,
+);
 
 const tryToExtractErrorFromOutput = (output: unknown) => {
   try {

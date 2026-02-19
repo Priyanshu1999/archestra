@@ -16,6 +16,7 @@ if (isMainModule) {
   await import("./observability/tracing");
 }
 
+import { readFileSync } from "node:fs";
 import fastifyCors from "@fastify/cors";
 import fastifyFormbody from "@fastify/formbody";
 import fastifySwagger from "@fastify/swagger";
@@ -470,6 +471,139 @@ const startMetricsServer = async () => {
   );
 };
 
+// ============ MCP Sandbox Server ============
+
+/** CSP configuration passed via ?csp= query param */
+interface McpUiResourceCsp {
+  resourceDomains?: string[];
+  connectDomains?: string[];
+  frameDomains?: string[];
+  baseUriDomains?: string[];
+}
+
+/**
+ * Validate CSP domain entries to prevent injection attacks.
+ * Rejects entries containing characters that could:
+ * - `;` or newlines: break out to new CSP directive
+ * - quotes: inject CSP keywords like 'unsafe-eval'
+ * - space: inject multiple sources in one entry
+ */
+export function sanitizeCspDomains(domains?: string[]): string[] {
+  if (!domains) return [];
+  return domains.filter((d) => typeof d === "string" && !/[;\r\n'" ]/.test(d));
+}
+
+export function buildCspHeader(csp?: McpUiResourceCsp): string {
+  const resourceDomains = sanitizeCspDomains(csp?.resourceDomains).join(" ");
+  const connectDomains = sanitizeCspDomains(csp?.connectDomains).join(" ");
+  const frameDomains = sanitizeCspDomains(csp?.frameDomains).join(" ") || null;
+  const baseUriDomains =
+    sanitizeCspDomains(csp?.baseUriDomains).join(" ") || null;
+
+  const directives = [
+    "default-src 'none'",
+    `script-src 'self' 'unsafe-inline' blob: data: ${resourceDomains}`.trim(),
+    `style-src 'self' 'unsafe-inline' blob: data: ${resourceDomains}`.trim(),
+    `img-src 'self' data: blob: ${resourceDomains}`.trim(),
+    `font-src 'self' data: blob: ${resourceDomains}`.trim(),
+    `connect-src 'self' ${connectDomains}`.trim(),
+    `worker-src 'self' blob: ${resourceDomains}`.trim(),
+    frameDomains ? `frame-src ${frameDomains}` : "frame-src 'none'",
+    "object-src 'none'",
+    baseUriDomains ? `base-uri ${baseUriDomains}` : "base-uri 'none'",
+  ];
+
+  return directives.join("; ");
+}
+
+let sandboxServerInstance: Awaited<
+  ReturnType<typeof createFastifyInstance>
+> | null = null;
+
+/**
+ * Start a dedicated sandbox server on a separate port for MCP App iframe isolation.
+ *
+ * Serves the sandbox proxy HTML with dynamic CSP headers based on the ?csp= query param.
+ * Must be on a different origin (port) than the main app for proper iframe sandboxing.
+ */
+const startSandboxServer = async () => {
+  const { port: sandboxPort, filePath } = config.mcpSandbox;
+
+  // Read sandbox HTML file at startup
+  let sandboxHtml: string;
+  try {
+    const rawHtml = readFileSync(filePath, "utf-8");
+    // Inject allowed origins at startup (comes from env config, doesn't change at runtime).
+    // The placeholder is replaced with a JSON array; empty array = allow any origin (dev/open mode).
+    sandboxHtml = rawHtml.replace(
+      "__ARCHESTRA_ALLOWED_ORIGINS__",
+      JSON.stringify(config.mcpSandbox.allowedOrigins),
+    );
+  } catch (err) {
+    logger.warn(
+      { err, filePath },
+      "MCP sandbox proxy HTML not found — sandbox server will not start",
+    );
+    return;
+  }
+
+  const sandboxServer = createFastifyInstance();
+  sandboxServerInstance = sandboxServer;
+
+  // CORS: allow the frontend origin to load the sandbox iframe
+  await sandboxServer.register(fastifyCors, {
+    origin: true,
+    methods: ["GET"],
+  });
+
+  // Serve sandbox.html with CSP from query params
+  sandboxServer.get(
+    "/mcp-sandbox-proxy.html",
+    {
+      schema: {
+        querystring: z.object({
+          csp: z.string().optional(),
+        }),
+      },
+    },
+    async (request, reply) => {
+      const { csp: cspParam } = request.query as { csp?: string };
+
+      // Parse CSP config from query param: ?csp=<url-encoded-json>
+      let cspConfig: McpUiResourceCsp | undefined;
+      if (cspParam) {
+        try {
+          cspConfig = JSON.parse(cspParam);
+        } catch {
+          request.log.warn("Invalid CSP query param");
+        }
+      }
+
+      // Set CSP via HTTP header — tamper-proof unlike meta tags
+      const cspHeader = buildCspHeader(cspConfig);
+      void reply.header("Content-Security-Policy", cspHeader);
+
+      // Prevent caching to ensure fresh CSP on each load
+      void reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+      void reply.header("Pragma", "no-cache");
+      void reply.header("Expires", "0");
+
+      void reply.type("text/html");
+      return reply.send(sandboxHtml);
+    },
+  );
+
+  // Catch-all: only sandbox.html is served on this port
+  sandboxServer.setNotFoundHandler((_request, reply) => {
+    return reply
+      .status(404)
+      .send("Only mcp-sandbox-proxy.html is served on this port");
+  });
+
+  await sandboxServer.listen({ port: sandboxPort, host });
+  sandboxServer.log.info(`MCP Sandbox server started on port ${sandboxPort}`);
+};
+
 const startMcpServerRuntime = async (
   fastify: ReturnType<typeof createFastifyInstance>,
 ) => {
@@ -608,6 +742,9 @@ const start = async () => {
     // Start metrics server
     await startMetricsServer();
 
+    // Start MCP sandbox server (separate origin for iframe isolation)
+    await startSandboxServer();
+
     logger.info(
       `Observability initialized with ${labelKeys.length} agent label keys`,
     );
@@ -724,6 +861,12 @@ const start = async () => {
         if (metricsServerInstance) {
           await metricsServerInstance.close();
           fastify.log.info("Metrics server closed");
+        }
+
+        // Close sandbox server (releases sandbox port)
+        if (sandboxServerInstance) {
+          await sandboxServerInstance.close();
+          fastify.log.info("Sandbox server closed");
         }
 
         // Close main server (releases port 9000)

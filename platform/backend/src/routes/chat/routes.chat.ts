@@ -20,7 +20,11 @@ import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
 import { hasAnyAgentTypeAdminPermission } from "@/auth";
 import { CacheKey, cacheManager } from "@/cache-manager";
-import { getChatMcpTools } from "@/clients/chat-mcp-client";
+import {
+  fetchToolUiResource,
+  getChatMcpTools,
+  getChatMcpToolUiResourceUris,
+} from "@/clients/chat-mcp-client";
 import { isVertexAiEnabled } from "@/clients/gemini-client";
 import {
   createDirectLLMModel,
@@ -65,6 +69,71 @@ import {
   stripImagesFromMessages,
   type UiMessage,
 } from "./strip-images-from-messages";
+
+/**
+ * Creates a TransformStream that throttles `tool-input-delta` events by breaking
+ * large delta chunks into smaller pieces with a configurable delay between each.
+ * LLMs often send hundreds of characters in a single delta, which would cause the
+ * frontend to "jump" rather than animate smoothly. This transform makes it look like
+ * natural typewriter streaming regardless of how the LLM batches its output.
+ */
+function createToolInputThrottler(
+  options: {
+    chunkSize?: number; // max chars per emitted delta chunk
+    delayMs?: number; // minimum ms between consecutive emits for the same tool call
+  } = {},
+): TransformStream {
+  const { chunkSize = 30, delayMs = 8 } = options;
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, ms));
+  // Track last-emit timestamp per tool call ID so rapid small chunks are also paced
+  const lastEmitAt = new Map<string, number>();
+
+  return new TransformStream({
+    async transform(
+      part: unknown,
+      controller: TransformStreamDefaultController<unknown>,
+    ) {
+      const p = part as {
+        type: string;
+        toolCallId?: string;
+        inputTextDelta?: string;
+        [key: string]: unknown;
+      };
+
+      if (p.type !== "tool-input-delta" || !p.inputTextDelta) {
+        controller.enqueue(part);
+        return;
+      }
+
+      const toolCallId = p.toolCallId ?? "__unknown__";
+      const { inputTextDelta, ...rest } = p as {
+        type: string;
+        toolCallId?: string;
+        inputTextDelta: string;
+        [key: string]: unknown;
+      };
+
+      const emit = async (chunk: string) => {
+        // Enforce minimum gap since the last emit for this tool call
+        const gap = Date.now() - (lastEmitAt.get(toolCallId) ?? 0);
+        if (gap < delayMs) {
+          await sleep(delayMs - gap);
+        }
+        controller.enqueue({ ...rest, inputTextDelta: chunk });
+        lastEmitAt.set(toolCallId, Date.now());
+      };
+
+      if (inputTextDelta.length <= chunkSize) {
+        await emit(inputTextDelta);
+      } else {
+        for (let i = 0; i < inputTextDelta.length; i += chunkSize) {
+          await emit(inputTextDelta.slice(i, i + chunkSize));
+        }
+      }
+    },
+  });
+}
 
 /**
  * Default model for each provider when no synced "best" model is available.
@@ -258,21 +327,24 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
       // Fetch MCP tools with enabled tool filtering
       // Pass undefined if no custom selection (use all tools)
       // Pass the actual array (even if empty) if there is custom selection
-      const mcpTools = await getChatMcpTools({
-        agentName: agent.name,
-        agentId,
-        userId: user.id,
-        userIsAgentAdmin,
-        enabledToolIds: hasCustomSelection ? enabledToolIds : undefined,
-        conversationId: conversation.id,
-        organizationId,
-        // Pass conversationId as sessionId to group all chat requests (including delegated agents) together
-        sessionId: conversation.id,
-        // Pass agentId as initial delegation chain (will be extended by delegated agents)
-        delegationChain: agentId,
-        abortSignal: chatAbortController.signal,
-        user: { id: user.id, email: user.email, name: user.name },
-      });
+      const [mcpTools, toolUiResourceUris] = await Promise.all([
+        getChatMcpTools({
+          agentName: agent.name,
+          agentId,
+          userId: user.id,
+          userIsAgentAdmin,
+          enabledToolIds: hasCustomSelection ? enabledToolIds : undefined,
+          conversationId: conversation.id,
+          organizationId,
+          // Pass conversationId as sessionId to group all chat requests (including delegated agents) together
+          sessionId: conversation.id,
+          // Pass agentId as initial delegation chain (will be extended by delegated agents)
+          delegationChain: agentId,
+          abortSignal: chatAbortController.signal,
+          user: { id: user.id, email: user.email, name: user.name },
+        }),
+        getChatMcpToolUiResourceUris(conversation.agentId),
+      ]);
 
       // Build system prompt from agent's systemPrompt and userPrompt fields
       let systemPrompt: string | undefined;
@@ -291,6 +363,13 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
       systemPromptParts.push(
         "When a tool execution is not approved by the user, do not retry it. Explain what happened and ask the user what they'd like to do instead.",
       );
+
+      // Add MCP UI instruction when tools are available
+      if (Object.keys(mcpTools).length > 0) {
+        systemPromptParts.push(
+          "When a tool result includes a UI resource, it means an interactive UI was rendered for the user. Respond with at most one brief sentence. Never describe, list, or explain what the UI shows.",
+        );
+      }
 
       // Combine all prompts into system prompt (system prompts first, then user prompts)
       if (systemPromptParts.length > 0 || userPromptParts.length > 0) {
@@ -423,104 +502,147 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
             },
             stream: createUIMessageStream({
               execute: async ({ writer }) => {
+                // When the LLM invokes a tool that has a UI resource, fetch
+                // the HTML on demand and emit a data-tool-ui-start SSE event so
+                // the frontend can render the MCP App iframe immediately without
+                // a second HTTP request.
+                streamTextConfig.onChunk = ({ chunk }) => {
+                  if (chunk.type === "tool-input-start" && chunk.toolName) {
+                    if (!conversation.agentId) {
+                      throw new ApiError(500, "Conversation agent ID not found");
+                    }
+                    const uiResourceUri = toolUiResourceUris[chunk.toolName];
+                    if (uiResourceUri) {
+                      const toolCallId = chunk.id;
+                      const toolName = chunk.toolName;
+                      fetchToolUiResource({
+                        agentId: conversation.agentId,
+                        userId: user.id,
+                        organizationId,
+                        userIsAgentAdmin,
+                        conversationId: conversation.id,
+                        toolName,
+                        uri: uiResourceUri,
+                      }).then((resource) => {
+                        writer.write({
+                          type: "data-tool-ui-start",
+                          data: {
+                            toolCallId,
+                            toolName,
+                            uiResourceUri,
+                            html: resource?.html,
+                            csp: resource?.csp,
+                            permissions: resource?.permissions,
+                          },
+                        });
+                      }).catch((err) => {
+                        logger.debug({ err, toolName }, "Failed to fetch UI resource for SSE");
+                      });;
+                    }
+                  }
+                };
+
                 const result = streamText(streamTextConfig);
 
-                // Merge the stream text result into the UI message stream
                 writer.merge(
-                  result.toUIMessageStream({
-                    originalMessages: messages as UIMessage[],
-                    onError: (error) => {
-                      // Use an async IIFE to handle async operations within the sync onError handler
-                      (async () => {
-                        logger.error(
+                  result
+                    .toUIMessageStream({
+                      originalMessages: messages as UIMessage[],
+                      onError: (error) => {
+                        // Use an async IIFE to handle async operations within the sync onError handler
+                        (async () => {
+                          logger.error(
+                            {
+                              error,
+                              conversationId,
+                              agentId,
+                            },
+                            "Chat stream error occurred",
+                          );
+
+                          // Persist messages despite error so they have a valid ID for editing
+                          // Only persist if not already persisted by onFinish
+                          if (!messagesPersisted && conversationId) {
+                            try {
+                              await persistNewMessages(
+                                conversationId,
+                                messages,
+                                "onError",
+                              );
+                              messagesPersisted = true;
+                            } catch (persistError) {
+                              // Log persistence error but don't prevent the error response
+                              logger.error(
+                                { persistError, conversationId },
+                                "Failed to persist messages during error handling",
+                              );
+                            }
+                          }
+                        })().catch((err) => {
+                          // Log any errors from the async IIFE but don't crash
+                          logger.error(
+                            { err },
+                            "Unexpected error in onError async handler",
+                          );
+                        });
+
+                        // Use pre-built error from subagent if available (preserves correct provider),
+                        // otherwise map the error with the current provider
+                        const mappedError: ChatErrorResponse =
+                          error instanceof ProviderError
+                            ? error.chatErrorResponse
+                            : mapProviderError(error, provider);
+
+                        logger.info(
                           {
-                            error,
-                            conversationId,
-                            agentId,
+                            mappedError,
+                            originalErrorType:
+                              error instanceof Error
+                                ? error.name
+                                : typeof error,
+                            willBeSentToFrontend: true,
                           },
-                          "Chat stream error occurred",
+                          "Returning mapped error to frontend via stream",
                         );
 
-                        // Persist messages despite error so they have a valid ID for editing
-                        // Only persist if not already persisted by onFinish
+                        // mapProviderError safely serializes raw errors, but add defensive try-catch
+                        try {
+                          return JSON.stringify(mappedError);
+                        } catch (stringifyError) {
+                          logger.error(
+                            { stringifyError, errorCode: mappedError.code },
+                            "Failed to stringify mapped error, returning minimal error",
+                          );
+                          // Return a minimal error response without the raw error
+                          return JSON.stringify({
+                            code: mappedError.code,
+                            message: mappedError.message,
+                            isRetryable: mappedError.isRetryable,
+                          });
+                        }
+                      },
+                      onFinish: async ({ messages: finalMessages }) => {
+                        removeAbortListeners();
+
+                        // Only persist if not already persisted by onError
                         if (!messagesPersisted && conversationId) {
                           try {
                             await persistNewMessages(
                               conversationId,
-                              messages,
-                              "onError",
+                              finalMessages,
+                              "onFinish",
                             );
                             messagesPersisted = true;
-                          } catch (persistError) {
-                            // Log persistence error but don't prevent the error response
+                          } catch (error) {
                             logger.error(
-                              { persistError, conversationId },
-                              "Failed to persist messages during error handling",
+                              { error, conversationId },
+                              "Failed to persist messages during onFinish",
                             );
                           }
                         }
-                      })().catch((err) => {
-                        // Log any errors from the async IIFE but don't crash
-                        logger.error(
-                          { err },
-                          "Unexpected error in onError async handler",
-                        );
-                      });
-
-                      // Use pre-built error from subagent if available (preserves correct provider),
-                      // otherwise map the error with the current provider
-                      const mappedError: ChatErrorResponse =
-                        error instanceof ProviderError
-                          ? error.chatErrorResponse
-                          : mapProviderError(error, provider);
-
-                      logger.info(
-                        {
-                          mappedError,
-                          originalErrorType:
-                            error instanceof Error ? error.name : typeof error,
-                          willBeSentToFrontend: true,
-                        },
-                        "Returning mapped error to frontend via stream",
-                      );
-
-                      // mapProviderError safely serializes raw errors, but add defensive try-catch
-                      try {
-                        return JSON.stringify(mappedError);
-                      } catch (stringifyError) {
-                        logger.error(
-                          { stringifyError, errorCode: mappedError.code },
-                          "Failed to stringify mapped error, returning minimal error",
-                        );
-                        // Return a minimal error response without the raw error
-                        return JSON.stringify({
-                          code: mappedError.code,
-                          message: mappedError.message,
-                          isRetryable: mappedError.isRetryable,
-                        });
-                      }
-                    },
-                    onFinish: async ({ messages: finalMessages }) => {
-                      removeAbortListeners();
-
-                      // Only persist if not already persisted by onError
-                      if (!messagesPersisted && conversationId) {
-                        try {
-                          await persistNewMessages(
-                            conversationId,
-                            finalMessages,
-                            "onFinish",
-                          );
-                          messagesPersisted = true;
-                        } catch (error) {
-                          logger.error(
-                            { error, conversationId },
-                            "Failed to persist messages during onFinish",
-                          );
-                        }
-                      }
-                    },
-                  }),
+                      },
+                    })
+                    .pipeThrough(createToolInputThrottler()),
                 );
 
                 // Wait for the stream to complete and get usage data

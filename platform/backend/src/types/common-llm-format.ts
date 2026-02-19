@@ -1,3 +1,4 @@
+import type { ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 /**
@@ -11,6 +12,8 @@ export type CommonMcpToolDefinition = {
   name: string;
   description?: string;
   inputSchema: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
+  annotations?: Record<string, unknown>;
 };
 
 export const CommonToolCallSchema = z
@@ -26,9 +29,11 @@ export type CommonToolCall = z.infer<typeof CommonToolCallSchema>;
 export type CommonToolResult = {
   id: string;
   name: string;
-  content: unknown;
+  content: ContentBlock[];
   isError: boolean;
   error?: string;
+  _meta?: Record<string, unknown>;
+  structuredContent?: Record<string, unknown>;
 };
 
 /**

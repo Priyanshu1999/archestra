@@ -149,6 +149,7 @@ export const mcpGatewayRoutes: FastifyPluginAsyncZod = async (fastify) => {
     `${endpoint}/:profileId`,
     {
       schema: {
+        operationId: "mcpGatewayGet",
         tags: ["mcp-gateway"],
         params: z.object({
           profileId: UuidIdSchema,
@@ -223,6 +224,7 @@ export const mcpGatewayRoutes: FastifyPluginAsyncZod = async (fastify) => {
     `${endpoint}/:profileId`,
     {
       schema: {
+        operationId: "mcpGatewayPost",
         tags: ["mcp-gateway"],
         params: z.object({
           profileId: UuidIdSchema,

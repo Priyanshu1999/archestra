@@ -549,6 +549,7 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
                   name: ToolModel.slugifyName(toolNamePrefix, tool.name),
                   description: tool.description,
                   parameters: tool.inputSchema,
+                  meta: { _meta: tool._meta, annotations: tool.annotations },
                   catalogId: capturedCatalogId,
                 }));
 
@@ -636,6 +637,7 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
           name: ToolModel.slugifyName(mcpServer.name, tool.name),
           description: tool.description,
           parameters: tool.inputSchema,
+          meta: { _meta: tool._meta, annotations: tool.annotations },
           catalogId: catalogItem.id,
         }));
 

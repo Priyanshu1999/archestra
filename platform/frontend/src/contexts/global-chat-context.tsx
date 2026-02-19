@@ -49,6 +49,23 @@ interface ChatSession {
   ) => void;
   /** Token usage for the current/last response */
   tokenUsage: TokenUsage | null;
+  /** Early UI data from data-tool-ui-start events (toolCallId → resource data incl. pre-fetched HTML) */
+  earlyToolUiStarts: Record<
+    string,
+    {
+      uiResourceUri: string;
+      html?: string;
+      csp?: { connectDomains?: string[]; resourceDomains?: string[] };
+      permissions?: {
+        camera?: boolean;
+        microphone?: boolean;
+        geolocation?: boolean;
+        clipboardWrite?: boolean;
+      };
+      /** Stored to identify PREFETCH entries where the key equals toolName */
+      toolName?: string;
+    }
+  >;
 }
 
 interface ChatContextValue {
@@ -228,6 +245,11 @@ function ChatSessionHook({
   // Track if title generation has been attempted for this conversation
   const titleGenerationAttemptedRef = useRef(false);
 
+  // Track early UI data from data-tool-ui-start events (toolCallId → resource data)
+  const [earlyToolUiStarts, setEarlyToolUiStarts] = useState<
+    ChatSession["earlyToolUiStarts"]
+  >({});
+
   const {
     messages,
     sendMessage,
@@ -245,6 +267,8 @@ function ChatSessionHook({
         [EXTERNAL_AGENT_ID_HEADER]: "Archestra Chat",
       },
     }),
+
+    experimental_throttle: 100,
     id: conversationId,
     onFinish: () => {
       queryClient.invalidateQueries({
@@ -284,6 +308,26 @@ function ChatSessionHook({
       if (dataPart.type === "data-token-usage") {
         const usage = dataPart.data as TokenUsage;
         setTokenUsage(usage);
+      }
+
+      // Handle data-tool-ui-start: backend emits this when a tool call starts streaming,
+      // so the frontend can render the MCP App container immediately (before tool finishes)
+      const customData = dataPart as unknown as {
+        type?: string;
+        data?: ChatSession["earlyToolUiStarts"][string] & {
+          toolCallId?: string;
+          toolName?: string;
+        };
+      };
+      if (customData.type === "data-tool-ui-start") {
+        const { toolCallId, toolName, uiResourceUri, html, csp, permissions } =
+          customData.data ?? {};
+        if (toolCallId && uiResourceUri) {
+          setEarlyToolUiStarts((prev) => ({
+            ...prev,
+            [toolCallId]: { uiResourceUri, html, csp, permissions, toolName },
+          }));
+        }
       }
     },
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithApprovalResponses,
@@ -337,6 +381,7 @@ function ChatSessionHook({
       pendingCustomServerToolCall,
       setPendingCustomServerToolCall,
       tokenUsage,
+      earlyToolUiStarts,
     };
 
     sessionsRef.current.set(conversationId, session);
@@ -354,6 +399,7 @@ function ChatSessionHook({
     addToolApprovalResponse,
     pendingCustomServerToolCall,
     tokenUsage,
+    earlyToolUiStarts,
     sessionsRef,
     notifySessionUpdate,
   ]);

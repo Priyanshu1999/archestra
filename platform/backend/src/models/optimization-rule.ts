@@ -1,5 +1,17 @@
-import type { SupportedProvider } from "@shared";
-import { and, asc, eq, getTableColumns, or, sql } from "drizzle-orm";
+import {
+  PROVIDERS_WITH_OPTIONAL_API_KEY,
+  type SupportedProvider,
+} from "@shared";
+import {
+  and,
+  asc,
+  eq,
+  getTableColumns,
+  inArray,
+  or,
+  type SQL,
+  sql,
+} from "drizzle-orm";
 import db, { schema } from "@/database";
 import logger from "@/logging";
 import type {
@@ -9,6 +21,16 @@ import type {
 } from "@/types";
 
 class OptimizationRuleModel {
+  static async findById(id: string): Promise<OptimizationRule | null> {
+    const [rule] = await db
+      .select()
+      .from(schema.optimizationRulesTable)
+      .where(eq(schema.optimizationRulesTable.id, id))
+      .limit(1);
+
+    return rule ?? null;
+  }
+
   /**
    * Create a new optimization rule
    */
@@ -148,6 +170,171 @@ class OptimizationRuleModel {
       "OptimizationRuleModel.update: completed",
     );
     return rule;
+  }
+
+  static async entityBelongsToOrganization(params: {
+    entityType: "organization" | "team" | "agent";
+    entityId: string;
+    organizationId: string;
+  }): Promise<boolean> {
+    if (params.entityType === "organization") {
+      return params.entityId === params.organizationId;
+    }
+
+    if (params.entityType === "team") {
+      const [team] = await db
+        .select({ id: schema.teamsTable.id })
+        .from(schema.teamsTable)
+        .where(
+          and(
+            eq(schema.teamsTable.id, params.entityId),
+            eq(schema.teamsTable.organizationId, params.organizationId),
+          ),
+        )
+        .limit(1);
+      return !!team;
+    }
+
+    const [agent] = await db
+      .select({ id: schema.agentsTable.id })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.id, params.entityId),
+          eq(schema.agentsTable.organizationId, params.organizationId),
+        ),
+      )
+      .limit(1);
+    return !!agent;
+  }
+
+  static async hasConfiguredProviderForEntity(params: {
+    entityType: "organization" | "team" | "agent";
+    entityId: string;
+    organizationId: string;
+    provider: SupportedProvider;
+  }): Promise<boolean> {
+    const accessConditions =
+      await OptimizationRuleModel.getProviderKeyAccessConditions(params);
+
+    if (accessConditions.length === 0) {
+      return false;
+    }
+
+    const accessCondition = or(...accessConditions);
+    const usableProviderKeyCondition =
+      OptimizationRuleModel.usableProviderKeyCondition();
+
+    const [apiKey] = await db
+      .select({ id: schema.llmProviderApiKeysTable.id })
+      .from(schema.llmProviderApiKeysTable)
+      .where(
+        and(
+          eq(
+            schema.llmProviderApiKeysTable.organizationId,
+            params.organizationId,
+          ),
+          eq(schema.llmProviderApiKeysTable.provider, params.provider),
+          usableProviderKeyCondition,
+          accessCondition,
+        ),
+      )
+      .limit(1);
+
+    return !!apiKey;
+  }
+
+  private static usableProviderKeyCondition(): SQL {
+    const condition = or(
+      sql`${schema.llmProviderApiKeysTable.secretId} IS NOT NULL`,
+      eq(schema.llmProviderApiKeysTable.isSystem, true),
+      inArray(schema.llmProviderApiKeysTable.provider, [
+        ...PROVIDERS_WITH_OPTIONAL_API_KEY,
+      ]),
+    );
+
+    if (!condition) {
+      throw new Error("Unable to build usable provider API key condition");
+    }
+
+    return condition;
+  }
+
+  private static async getProviderKeyAccessConditions(params: {
+    entityType: "organization" | "team" | "agent";
+    entityId: string;
+    organizationId: string;
+  }): Promise<SQL[]> {
+    const accessConditions: SQL[] = [
+      eq(schema.llmProviderApiKeysTable.scope, "org"),
+    ];
+
+    if (params.entityType === "team") {
+      accessConditions.push(
+        and(
+          eq(schema.llmProviderApiKeysTable.scope, "team"),
+          eq(schema.llmProviderApiKeysTable.teamId, params.entityId),
+        ) as SQL,
+      );
+      return accessConditions;
+    }
+
+    if (params.entityType !== "agent") {
+      return accessConditions;
+    }
+
+    const [agent] = await db
+      .select({
+        id: schema.agentsTable.id,
+        scope: schema.agentsTable.scope,
+        authorId: schema.agentsTable.authorId,
+        llmApiKeyId: schema.agentsTable.llmApiKeyId,
+      })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.id, params.entityId),
+          eq(schema.agentsTable.organizationId, params.organizationId),
+        ),
+      )
+      .limit(1);
+
+    if (!agent) {
+      return [];
+    }
+
+    if (agent.llmApiKeyId) {
+      accessConditions.push(
+        eq(schema.llmProviderApiKeysTable.id, agent.llmApiKeyId),
+      );
+    }
+
+    if (agent.scope === "personal" && agent.authorId) {
+      accessConditions.push(
+        and(
+          eq(schema.llmProviderApiKeysTable.scope, "personal"),
+          eq(schema.llmProviderApiKeysTable.userId, agent.authorId),
+        ) as SQL,
+      );
+    }
+
+    const agentTeamIds = await db
+      .select({ teamId: schema.agentTeamsTable.teamId })
+      .from(schema.agentTeamsTable)
+      .where(eq(schema.agentTeamsTable.agentId, params.entityId));
+    if (agent.scope === "team" && agentTeamIds.length > 0) {
+      accessConditions.push(
+        and(
+          eq(schema.llmProviderApiKeysTable.scope, "team"),
+          inArray(
+            schema.llmProviderApiKeysTable.teamId,
+            agentTeamIds.map((row) => row.teamId),
+          ),
+        ) as SQL,
+      );
+    }
+
+    return accessConditions;
   }
 
   /**

@@ -60,6 +60,8 @@ Typical uses:
 
 Rules are applied by priority order. This makes them useful for layered policies, where a specific exception should win over a general fallback.
 
+An optimization rule can only target a provider that has a configured LLM provider key available to the rule's scope. Organization rules need an organization-level provider key, team rules can use a team or organization key, and personal agent rules can use the agent owner's personal key.
+
 ## TOON Compression
 
 TOON compression reduces the token footprint of structured tool results before they are passed to the model. Archestra keeps the original JSON for application logic, then converts the model-facing representation to TOON when compression is enabled and when the converted form is actually smaller.

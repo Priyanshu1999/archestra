@@ -19,7 +19,25 @@ describe("TeamModel", () => {
       expect(team.name).toBe("Engineering");
       expect(team.description).toBe("Engineering team");
       expect(team.organizationId).toBe(org.id);
+      expect(team.convertToolResultsToToon).toBe(false);
       expect(team.members).toEqual([]);
+    });
+
+    test("should create a team with TOON compression enabled", async ({
+      makeUser,
+      makeOrganization,
+    }) => {
+      const user = await makeUser();
+      const org = await makeOrganization();
+
+      const team = await TeamModel.create({
+        name: "Analytics",
+        organizationId: org.id,
+        createdBy: user.id,
+        convertToolResultsToToon: true,
+      });
+
+      expect(team.convertToolResultsToToon).toBe(true);
     });
   });
 

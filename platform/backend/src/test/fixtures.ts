@@ -163,7 +163,9 @@ async function makeOrganization(
 async function makeTeam(
   organizationId: string,
   createdBy: string,
-  overrides: Partial<Pick<InsertTeam, "name" | "description">> = {},
+  overrides: Partial<
+    Pick<InsertTeam, "name" | "description" | "convertToolResultsToToon">
+  > = {},
 ) {
   const [team] = await db
     .insert(schema.teamsTable)

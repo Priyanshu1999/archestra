@@ -82,6 +82,7 @@ Archestra records before/after token counts and savings when compression is appl
 You can enable TOON compression at:
 
 - organization level for all traffic
-- team level when only certain teams should use it
+- team level when only certain teams should use it; team settings apply to agents
+  and MCP gateways assigned to that team even when organization-wide TOON is disabled
 
 See the upstream TOON format project for the format specification and benchmarks: [toon-format/toon](https://github.com/toon-format/toon).

@@ -218,6 +218,22 @@ describe("team routes", () => {
       expect(team.id).toBeDefined();
     });
 
+    test("creates a team with TOON compression enabled", async () => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/teams",
+        payload: {
+          name: "Compressed Team",
+          convertToolResultsToToon: true,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const team = response.json();
+      expect(team.name).toBe("Compressed Team");
+      expect(team.convertToolResultsToToon).toBe(true);
+    });
+
     test("gets a team by id", async ({ makeTeam }) => {
       const team = await makeTeam(organizationId, adminUser.id, {
         name: "Lookup Team",

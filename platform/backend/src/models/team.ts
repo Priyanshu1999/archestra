@@ -33,6 +33,7 @@ class TeamModel {
         id: teamId,
         name: input.name,
         description: input.description || null,
+        convertToolResultsToToon: input.convertToolResultsToToon ?? false,
         organizationId: input.organizationId,
         createdBy: input.createdBy,
         createdAt: now,

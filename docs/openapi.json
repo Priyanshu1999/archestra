@@ -163440,6 +163440,9 @@
                   },
                   "description": {
                     "type": "string"
+                  },
+                  "convertToolResultsToToon": {
+                    "type": "boolean"
                   }
                 },
                 "required": [

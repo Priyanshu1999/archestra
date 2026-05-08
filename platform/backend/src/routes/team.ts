@@ -84,11 +84,19 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(SelectTeamSchema),
       },
     },
-    async ({ body: { name, description }, user, organizationId }, reply) => {
+    async (
+      {
+        body: { name, description, convertToolResultsToToon },
+        user,
+        organizationId,
+      },
+      reply,
+    ) => {
       return reply.send(
         await TeamModel.create({
           name,
           description,
+          convertToolResultsToToon,
           organizationId,
           createdBy: user.id,
         }),

@@ -56,26 +56,45 @@ export async function shouldApplyToonCompression(
     return false;
   }
 
-  // Check compression scope and determine if TOON should be applied
-  if (organization.compressionScope === "organization") {
+  if (
+    organization.compressionScope === "organization" &&
+    organization.convertToolResultsToToon
+  ) {
     logger.info(
-      { agentId, enabled: organization.convertToolResultsToToon },
+      { agentId, enabled: true },
       "TOON compression: organization-level scope",
     );
-    return organization.convertToolResultsToToon;
+    return true;
+  }
+
+  const profileTeams =
+    agentTeamIds.length > 0 ? await TeamModel.getTeamsForAgent(agentId) : [];
+  const shouldApplyTeamCompression = profileTeams.some(
+    (team) => team.convertToolResultsToToon,
+  );
+
+  if (shouldApplyTeamCompression) {
+    logger.info(
+      { agentId, teamsCount: profileTeams.length, enabled: true },
+      "TOON compression: team-level setting enabled",
+    );
+    return true;
+  }
+
+  if (organization.compressionScope === "organization") {
+    logger.info(
+      { agentId, enabled: false },
+      "TOON compression: organization-level scope",
+    );
+    return false;
   }
 
   if (organization.compressionScope === "team") {
-    // Team-level: check if ANY of the profile's teams have compression enabled
-    const profileTeams = await TeamModel.getTeamsForAgent(agentId);
-    const shouldApply = profileTeams.some(
-      (team) => team.convertToolResultsToToon,
-    );
     logger.info(
-      { agentId, teamsCount: profileTeams.length, enabled: shouldApply },
+      { agentId, teamsCount: profileTeams.length, enabled: false },
       "TOON compression: team-level scope",
     );
-    return shouldApply;
+    return false;
   }
 
   // Default: compression disabled
